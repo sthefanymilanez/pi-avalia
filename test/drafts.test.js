@@ -1,0 +1,64 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+process.env.DATABASE_URL = '';
+process.env.PI_AVALIA_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-avalia-test-'));
+const store = require('../src/store');
+const { server, start } = require('../server');
+
+test('API mantém um rascunho parcial e só permite enviar a ficha completa', async () => {
+  const oldStore = store.getLocalSnapshotForTests();
+  await start(0);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  let projectId;
+  try {
+    const unauthorized = await fetch(`${base}/api/projects`);
+    assert.equal(unauthorized.status, 401);
+    const registration = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Professora de Teste', email: 'professora.teste@example.edu', password: 'Senha segura 123!' }) });
+    assert.equal(registration.status, 201);
+    const cookie = registration.headers.get('set-cookie').split(';')[0];
+    const userData = await registration.json();
+    assert.equal(userData.user.name, 'Professora de Teste');
+    assert.equal(Object.hasOwn(userData.user, 'passwordHash'), false);
+    const userStore = store.getLocalSnapshotForTests();
+    assert.match(userStore.users[0].passwordHash, /^[a-f0-9]+:[a-f0-9]+$/);
+    const duplicate = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Duplicada', email: 'professora.teste@example.edu', password: 'Senha segura 123!' }) });
+    assert.equal(duplicate.status, 409);
+    const logout = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: { Cookie: cookie } });
+    assert.equal(logout.status, 200);
+    const invalidLogin = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'professora.teste@example.edu', password: 'senha errada' }) });
+    assert.equal(invalidLogin.status, 401);
+    const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'professora.teste@example.edu', password: 'Senha segura 123!' }) });
+    assert.equal(login.status, 200);
+    const loginCookie = login.headers.get('set-cookie').split(';')[0];
+    const create = await fetch(`${base}/api/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: loginCookie }, body: JSON.stringify({ title: 'Teste automatizado PI AVALIA', scale: 10 }) });
+    assert.equal(create.status, 201);
+    projectId = (await create.json()).id;
+    const start = await fetch(`${base}/api/projects/${projectId}/evaluations`, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: loginCookie }, body: JSON.stringify({ scale: 10, scores: Array(10).fill(null) }) });
+    assert.equal(start.status, 201);
+    const draft = await start.json();
+    const partial = Array(10).fill(null); partial[0] = 8;
+    const save = await fetch(`${base}/api/projects/${projectId}/evaluations/${draft.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: loginCookie }, body: JSON.stringify({ scores: partial, criterionNotes: Array(10).fill(''), status: 'em_andamento' }) });
+    assert.equal(save.status, 200);
+    assert.equal((await save.json()).result, null);
+    const submitPartial = await fetch(`${base}/api/projects/${projectId}/evaluations/${draft.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: loginCookie }, body: JSON.stringify({ scores: partial, status: 'enviada' }) });
+    assert.equal(submitPartial.status, 400);
+    const complete = await fetch(`${base}/api/projects/${projectId}/evaluations/${draft.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: loginCookie }, body: JSON.stringify({ scores: Array(10).fill(8), status: 'enviada' }) });
+    assert.equal(complete.status, 200);
+    const final = await complete.json();
+    assert.equal(final.status, 'enviada');
+    assert.deepEqual(final.result, { document: 56, presentation: 24, total: 80 });
+    const locked = await fetch(`${base}/api/projects/${projectId}/evaluations/${draft.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Cookie: loginCookie }, body: JSON.stringify({ scores: Array(10).fill(7), status: 'enviada' }) });
+    assert.equal(locked.status, 409);
+    const outsiderRegistration = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Outro Professor', email: 'outro.professor@example.edu', password: 'Outra senha forte 123!' }) });
+    const outsiderCookie = outsiderRegistration.headers.get('set-cookie').split(';')[0];
+    const outsiderProjects = await fetch(`${base}/api/projects`, { headers: { Cookie: outsiderCookie } });
+    assert.deepEqual(await outsiderProjects.json(), []);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    store.restoreLocalSnapshotForTests(oldStore);
+    fs.rmSync(process.env.PI_AVALIA_DATA_DIR, { recursive: true, force: true });
+  }
+});

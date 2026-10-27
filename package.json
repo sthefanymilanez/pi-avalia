@@ -1,0 +1,25 @@
+{
+  "name": "pi-avalia",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Base incremental do PI AVALIA",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "db:migrate": "node scripts/migrate.js",
+    "db:import-json": "node scripts/import-json.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "nodemailer": "^10.2.1",
+    "pdfjs-dist": "5.7.284",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11"
+  }
+}

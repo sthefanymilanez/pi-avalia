@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pi_avalia
+      POSTGRES_USER: pi_avalia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-change-me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pi_avalia_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pi_avalia -d pi_avalia"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://pi_avalia:${POSTGRES_PASSWORD:-local-dev-change-me}@db:5432/pi_avalia
+      DATABASE_SSL: "false"
+    ports:
+      - "3188:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "-c", "npm run db:migrate && npm start"]
+
+volumes:
+  pi_avalia_db:
