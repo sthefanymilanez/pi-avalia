@@ -132,7 +132,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/criteria' && req.method === 'GET') return send(res, 200, criteria);
     const user = await storage.findUserBySession(getCookie(req, sessionCookie));
-    if ((url.pathname.startsWith('/api/projects') || url.pathname.startsWith('/api/ai/')) && !user) return send(res, 401, { error: 'Entre na sua conta para acessar esta área.' });
+    if ((url.pathname.startsWith('/api/projects') || url.pathname.startsWith('/api/invitations') || url.pathname.startsWith('/api/ai/')) && !user) return send(res, 401, { error: 'Entre na sua conta para acessar esta área.' });
     if (url.pathname === '/api/ai/profiles' && req.method === 'GET') {
       let profiles = await storage.listProfiles(user.id);
       if (!profiles.length) profiles = [await storage.createProfile(user.id, { id: randomUUID(), name: DEFAULT_PROFILE.name, normCode: 'ABNT NBR 14724', edition: '2011', year: 2026, source: DEFAULT_PROFILE.source, rules: DEFAULT_PROFILE.rules })];
@@ -169,6 +169,18 @@ const server = http.createServer(async (req, res) => {
       const project = await storage.createProject(user.id, { title, course: String(input.course || '').trim(), className: String(input.className || '').trim(), team: String(input.team || '').trim(), scale }, randomUUID(), new Date().toISOString());
       return send(res, 201, project);
     }
+    if(url.pathname==='/api/invitations'&&req.method==='GET')return send(res,200,await storage.listProjectInvitations(user.id));
+    if(url.pathname==='/api/invitations'&&req.method==='POST'){
+      const input=await body(req);const projectId=String(input.projectId||'').trim();const email=String(input.email||'').trim().toLowerCase();
+      if(!projectId||email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return send(res,400,{error:'Selecione o projeto e informe um e-mail válido do professor.'});
+      const invitation=await storage.createProjectInvitation(user.id,projectId,email,randomUUID(),new Date().toISOString());let emailSent=false;const transporter=resetMailer();
+      if(transporter){const base=String(process.env.APP_BASE_URL||(process.env.RENDER_EXTERNAL_URL||'')).replace(/\/$/,'');try{await transporter.sendMail({from:process.env.SMTP_FROM,to:email,subject:'Convite para banca — PI AVALIA',text:`Olá, ${invitation.inviteeName}.\n\n${user.name} convidou você para participar da banca do projeto “${invitation.projectTitle}” no PI AVALIA. Entre na sua conta usando este endereço e abra a área “Convites e Bancas” para aceitar ou recusar o convite.\n\n${base}\n`});emailSent=true;}catch(error){console.error(`Invitation email failed: ${error.message}`);}}
+      return send(res,201,{...invitation,emailSent});
+    }
+    const invitationResponse=url.pathname.match(/^\/api\/invitations\/([^/]+)\/respond$/);
+    if(invitationResponse&&req.method==='POST'){const input=await body(req);await storage.respondProjectInvitation(user.id,invitationResponse[1],input.decision,new Date().toISOString());return send(res,200,{status:input.decision});}
+    const invitationRevoke=url.pathname.match(/^\/api\/invitations\/([^/]+)$/);
+    if(invitationRevoke&&req.method==='DELETE'){await storage.revokeProjectInvitation(user.id,invitationRevoke[1],new Date().toISOString());return send(res,200,{status:'revoked'});}
     const match = url.pathname.match(/^\/api\/projects\/([^/]+)\/evaluations$/);
     if (match && req.method === 'POST') {
       const input = await body(req); const scores = validateDraft({ ...input, status: 'rascunho' }, input.scale);

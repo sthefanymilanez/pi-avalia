@@ -5,7 +5,7 @@ Este diretório estava vazio (sem repositório ou aplicação existente). O cont
 ## Plano incremental
 
 1. Criar a base da aplicação e implementar projetos, ficha versionada com os dez critérios, avaliações individuais, cálculo institucional 70/30 nas escalas 0–1 e 0–10 e modo banca móvel com rascunho automático.
-2. Completar convites e permissões por projeto, armazenamento privado e ampliar as migrações conforme novos módulos forem adicionados.
+2. Completar armazenamento privado e ampliar as migrações conforme novos módulos forem adicionados.
 3. Acrescentar relatórios PDF, exclusão controlada e consolidar médias da banca.
 4. Conectar provedor de IA e serviços de similaridade somente após definir privacidade, fontes, limites e revisão humana.
 5. Validar fluxos e documentar implantação.
@@ -63,7 +63,7 @@ Ficha inicial congelada na versão 1, com os dez critérios do Modelo de Critér
 
 ## Pendências antes de uso institucional
 
-- Convites, participação de avaliadores e autorização por relacionamento entre professor, projeto e banca.
+- Convites já permitem participação de professores cadastrados em bancas compartilhadas; ainda não há contas de alunos, permissões por critério nem exportação de relatórios de banca.
 - Ambiente PostgreSQL hospedado e credenciais de implantação.
 - Migração dos dados antigos de `data/store.json` para PostgreSQL, se houver dados que precisem ser preservados.
 - Upload/armazenamento privado com validação de PDF e gestão de versões.

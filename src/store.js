@@ -18,17 +18,17 @@ function readLocal() {
   fs.mkdirSync(dataDir, { recursive: true });
   if (!fs.existsSync(storePath)) fs.writeFileSync(storePath, JSON.stringify({ users: [], projects: [] }, null, 2));
   const raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-  return { users: raw.users || [], projects: raw.projects || [], profiles: raw.profiles || [], analyses: raw.analyses || [], passwordResets: raw.passwordResets || [] };
+  return { users: raw.users || [], projects: raw.projects || [], profiles: raw.profiles || [], analyses: raw.analyses || [], passwordResets: raw.passwordResets || [], invitations: raw.invitations || [] };
 }
 function writeLocal(store) {
   fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(storePath, JSON.stringify({ users: store.users || [], projects: store.projects || [], profiles: store.profiles || [], analyses: store.analyses || [], passwordResets: store.passwordResets || [] }, null, 2));
+  fs.writeFileSync(storePath, JSON.stringify({ users: store.users || [], projects: store.projects || [], profiles: store.profiles || [], analyses: store.analyses || [], passwordResets: store.passwordResets || [], invitations: store.invitations || [] }, null, 2));
 }
 function mapEvaluation(row) {
   return { id: row.id, evaluator: row.evaluator_name, evaluatorId: row.evaluator_id, status: row.status, scores: row.scores, criterionNotes: row.criterion_notes, comments: row.comments, result: row.result, createdAt: row.created_at, updatedAt: row.updated_at };
 }
 function mapProject(row) {
-  return { id: row.id, ownerId: row.owner_id, title: row.title, course: row.course, className: row.class_name, team: row.team, scale: row.scale, sheetVersion: row.sheet_version, createdAt: row.created_at, evaluations: (row.evaluations || []).map(mapEvaluation) };
+  return { id: row.id, ownerId: row.owner_id, ownerName: row.owner_name || '', isOwner: Boolean(row.is_owner), title: row.title, course: row.course, className: row.class_name, team: row.team, scale: row.scale, sheetVersion: row.sheet_version, createdAt: row.created_at, evaluations: (row.evaluations || []).map(mapEvaluation) };
 }
 
 async function initialize() {
@@ -117,22 +117,23 @@ async function createProject(userId, input, id, createdAt) {
 async function listProjects(userId) {
   requireInitialized();
   if (pool) {
-    const result = await pool.query(`SELECT p.*, COALESCE(jsonb_agg(jsonb_build_object(
+    const result = await pool.query(`SELECT p.*, owner.full_name AS owner_name, (p.owner_id=$1) AS is_owner, COALESCE(jsonb_agg(jsonb_build_object(
       'id', e.id, 'evaluator_name', evaluator.full_name, 'evaluator_id', e.evaluator_id,
       'status', e.status, 'scores', e.scores, 'criterion_notes', e.criterion_notes,
       'comments', e.comments, 'result', e.result, 'created_at', e.created_at, 'updated_at', e.updated_at
-    )) FILTER (WHERE e.id IS NOT NULL), '[]'::jsonb) AS evaluations
-    FROM projects p LEFT JOIN evaluations e ON e.project_id=p.id
+    )) FILTER (WHERE e.id IS NOT NULL AND (e.status='enviada' OR e.evaluator_id=$1)), '[]'::jsonb) AS evaluations
+    FROM projects p JOIN professors owner ON owner.id=p.owner_id LEFT JOIN evaluations e ON e.project_id=p.id
     LEFT JOIN professors evaluator ON evaluator.id=e.evaluator_id
-    WHERE p.owner_id=$1 GROUP BY p.id ORDER BY p.created_at DESC`, [userId]);
+    WHERE p.owner_id=$1 OR EXISTS (SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$1 AND i.status='accepted') GROUP BY p.id, owner.full_name ORDER BY p.created_at DESC`, [userId]);
     return result.rows.map(mapProject);
   }
-  return readLocal().projects.filter((project) => project.ownerId === userId);
+  const store=readLocal();const accepted=new Set(store.invitations.filter(i=>i.inviteeId===userId&&i.status==='accepted').map(i=>i.projectId));
+  return store.projects.filter(project=>project.ownerId===userId||accepted.has(project.id)).map(project=>({...project,isOwner:project.ownerId===userId,ownerName:store.users.find(u=>u.id===project.ownerId)?.name||''})).map(project=>({...project,evaluations:project.evaluations.filter(e=>e.status==='enviada'||e.evaluatorId===userId)}));
 }
 async function createEvaluation(projectId, ownerId, evaluator, input, evaluationId, now) {
   requireInitialized();
   if (pool) {
-    const projectResult = await pool.query('SELECT id, scale FROM projects WHERE id=$1 AND owner_id=$2', [projectId, ownerId]);
+    const projectResult = await pool.query("SELECT p.id, p.scale FROM projects p WHERE p.id=$1 AND (p.owner_id=$2 OR EXISTS (SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$2 AND i.status='accepted'))", [projectId, ownerId]);
     if (!projectResult.rows[0]) throw new StoreError(404, 'Projeto não encontrado.');
     if (input.scale !== projectResult.rows[0].scale) throw new StoreError(400, 'A escala precisa corresponder à escala configurada na ficha do projeto.');
     const result = await pool.query(`INSERT INTO evaluations (id, project_id, evaluator_id, status, scores, criterion_notes, comments, result, created_at, updated_at)
@@ -144,7 +145,7 @@ async function createEvaluation(projectId, ownerId, evaluator, input, evaluation
     if (!result.rows[0]) throw new StoreError(409, 'Você já enviou uma avaliação definitiva para este projeto.');
     const row = result.rows[0]; return { ...mapEvaluation({ ...row, evaluator_name: evaluator.name }), wasExisting: row.id !== evaluationId };
   }
-  const store = readLocal(); const project = store.projects.find((item) => item.id === projectId && item.ownerId === ownerId);
+  const store = readLocal(); const allowed=store.invitations.some(i=>i.projectId===projectId&&i.inviteeId===ownerId&&i.status==='accepted');const project = store.projects.find((item) => item.id === projectId && (item.ownerId === ownerId||allowed));
   if (!project) throw new StoreError(404, 'Projeto não encontrado.');
   if (input.scale !== project.scale) throw new StoreError(400, 'A escala precisa corresponder à escala configurada na ficha do projeto.');
   const existing = project.evaluations.find((item) => item.evaluatorId === evaluator.id);
@@ -157,19 +158,53 @@ async function updateEvaluation(projectId, ownerId, evaluationId, evaluatorId, u
   requireInitialized();
   if (pool) {
     const result = await pool.query(`UPDATE evaluations e SET status=$1, scores=$2, criterion_notes=$3, comments=$4, result=$5, updated_at=$6
-      FROM projects p WHERE e.project_id=p.id AND p.owner_id=$7 AND e.project_id=$8 AND e.id=$9 AND e.evaluator_id=$10 AND e.status <> 'enviada'
+      FROM projects p WHERE e.project_id=p.id AND (p.owner_id=$7 OR EXISTS (SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$7 AND i.status='accepted')) AND e.project_id=$8 AND e.id=$9 AND e.evaluator_id=$10 AND e.status <> 'enviada'
       RETURNING e.id`, [updates.status, JSON.stringify(updates.scores), JSON.stringify(updates.criterionNotes), updates.comments, updates.result ? JSON.stringify(updates.result) : null, updates.updatedAt, ownerId, projectId, evaluationId, evaluatorId]);
     if (result.rowCount) return;
-    const check = await pool.query(`SELECT e.status FROM evaluations e JOIN projects p ON p.id=e.project_id WHERE p.owner_id=$1 AND e.project_id=$2 AND e.id=$3 AND e.evaluator_id=$4`, [ownerId, projectId, evaluationId, evaluatorId]);
+    const check = await pool.query(`SELECT e.status FROM evaluations e JOIN projects p ON p.id=e.project_id WHERE (p.owner_id=$1 OR EXISTS (SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$1 AND i.status='accepted')) AND e.project_id=$2 AND e.id=$3 AND e.evaluator_id=$4`, [ownerId, projectId, evaluationId, evaluatorId]);
     if (!check.rows[0]) throw new StoreError(404, 'Rascunho não encontrado.');
     if (check.rows[0].status === 'enviada') throw new StoreError(409, 'Esta avaliação já foi enviada e não pode ser alterada.');
     throw new StoreError(400, 'A avaliação não pôde ser salva.');
   }
-  const store = readLocal(); const project = store.projects.find((item) => item.id === projectId && item.ownerId === ownerId);
+  const store=readLocal();const allowed=store.invitations.some(i=>i.projectId===projectId&&i.inviteeId===ownerId&&i.status==='accepted');const project=store.projects.find(item=>item.id===projectId&&(item.ownerId===ownerId||allowed));
   const evaluation = project?.evaluations.find((item) => item.id === evaluationId && item.evaluatorId === evaluatorId);
   if (!evaluation) throw new StoreError(404, 'Rascunho não encontrado.');
   if (evaluation.status === 'enviada') throw new StoreError(409, 'Esta avaliação já foi enviada e não pode ser alterada.');
   Object.assign(evaluation, updates); writeLocal(store);
+}
+async function createProjectInvitation(ownerId, projectId, email, invitationId, now) {
+  requireInitialized();
+  if (pool) {
+    const project=(await pool.query('SELECT id,title FROM projects WHERE id=$1 AND owner_id=$2',[projectId,ownerId])).rows[0];
+    if(!project)throw new StoreError(404,'Projeto não encontrado ou você não é responsável por ele.');
+    const invitee=(await pool.query('SELECT id,email,full_name AS name FROM professors WHERE lower(email)=lower($1)',[email])).rows[0];
+    if(!invitee)throw new StoreError(404,'Esse e-mail ainda não tem cadastro. Peça ao professor para criar a conta e tente novamente.');
+    if(invitee.id===ownerId)throw new StoreError(400,'Você já é responsável pelo projeto.');
+    const prior=(await pool.query("SELECT status FROM project_invitations WHERE project_id=$1 AND invitee_id=$2 AND status IN ('pending','accepted')",[projectId,invitee.id])).rows[0];
+    if(prior)throw new StoreError(409,prior.status==='accepted'?'Esse professor já participa da banca.':'Já existe um convite pendente para esse professor.');
+    try{const result=await pool.query("INSERT INTO project_invitations(id,project_id,inviter_id,invitee_id,status,created_at) VALUES($1,$2,$3,$4,'pending',$5) RETURNING id,project_id AS \"projectId\",inviter_id AS \"inviterId\",invitee_id AS \"inviteeId\",status,created_at AS \"createdAt\"",[invitationId,projectId,ownerId,invitee.id,now]);return {...result.rows[0],projectTitle:project.title,inviteeEmail:invitee.email,inviteeName:invitee.name};}
+    catch(error){if(error.code==='23505')throw new StoreError(409,'Já existe um convite ativo para esse professor.');throw error;}
+  }
+  const store=readLocal();const project=store.projects.find(p=>p.id===projectId&&p.ownerId===ownerId);if(!project)throw new StoreError(404,'Projeto não encontrado ou você não é responsável por ele.');
+  const invitee=store.users.find(u=>u.email.toLowerCase()===email.toLowerCase());if(!invitee)throw new StoreError(404,'Esse e-mail ainda não tem cadastro. Peça ao professor para criar a conta e tente novamente.');
+  if(invitee.id===ownerId)throw new StoreError(400,'Você já é responsável pelo projeto.');
+  const prior=store.invitations.find(i=>i.projectId===projectId&&i.inviteeId===invitee.id&&['pending','accepted'].includes(i.status));if(prior)throw new StoreError(409,prior.status==='accepted'?'Esse professor já participa da banca.':'Já existe um convite pendente para esse professor.');
+  const inviter=store.users.find(u=>u.id===ownerId);const invitation={id:invitationId,projectId,projectTitle:project.title,inviterId:ownerId,inviterName:inviter?.name||'',inviteeId:invitee.id,inviteeName:invitee.name,inviteeEmail:invitee.email,status:'pending',createdAt:now,respondedAt:null};store.invitations.push(invitation);writeLocal(store);return invitation;
+}
+async function listProjectInvitations(userId) {
+  requireInitialized();
+  if(pool){const result=await pool.query(`SELECT i.id,i.project_id AS "projectId",p.title AS "projectTitle",i.inviter_id AS "inviterId",owner.full_name AS "inviterName",i.invitee_id AS "inviteeId",invitee.full_name AS "inviteeName",invitee.email AS "inviteeEmail",i.status,i.created_at AS "createdAt",i.responded_at AS "respondedAt",(i.invitee_id=$1) AS received FROM project_invitations i JOIN projects p ON p.id=i.project_id JOIN professors owner ON owner.id=i.inviter_id JOIN professors invitee ON invitee.id=i.invitee_id WHERE i.invitee_id=$1 OR i.inviter_id=$1 ORDER BY i.created_at DESC`,[userId]);return result.rows;}
+  const store=readLocal();return store.invitations.filter(i=>i.inviteeId===userId||i.inviterId===userId).map(i=>({...i,projectTitle:store.projects.find(p=>p.id===i.projectId)?.title||'',inviterName:store.users.find(u=>u.id===i.inviterId)?.name||'',inviteeName:store.users.find(u=>u.id===i.inviteeId)?.name||'',inviteeEmail:store.users.find(u=>u.id===i.inviteeId)?.email||'',received:i.inviteeId===userId})).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
+}
+async function respondProjectInvitation(userId, invitationId, decision, now) {
+  requireInitialized();if(!['accepted','declined'].includes(decision))throw new StoreError(400,'Resposta de convite inválida.');
+  if(pool){const result=await pool.query("UPDATE project_invitations SET status=$1,responded_at=$2 WHERE id=$3 AND invitee_id=$4 AND status='pending' RETURNING id",[decision,now,invitationId,userId]);if(!result.rowCount)throw new StoreError(404,'Convite não encontrado ou já respondido.');return;}
+  const store=readLocal();const invitation=store.invitations.find(i=>i.id===invitationId&&i.inviteeId===userId&&i.status==='pending');if(!invitation)throw new StoreError(404,'Convite não encontrado ou já respondido.');invitation.status=decision;invitation.respondedAt=now;writeLocal(store);
+}
+async function revokeProjectInvitation(userId, invitationId, now) {
+  requireInitialized();
+  if(pool){const result=await pool.query("UPDATE project_invitations SET status='revoked',responded_at=$1 WHERE id=$2 AND inviter_id=$3 AND status IN ('pending','accepted') RETURNING id",[now,invitationId,userId]);if(!result.rowCount)throw new StoreError(404,'Convite ou participação ativa não encontrado.');return;}
+  const store=readLocal();const invitation=store.invitations.find(i=>i.id===invitationId&&i.inviterId===userId&&['pending','accepted'].includes(i.status));if(!invitation)throw new StoreError(404,'Convite ou participação ativa não encontrado.');invitation.status='revoked';invitation.respondedAt=now;writeLocal(store);
 }
 async function listProfiles(userId) {
   requireInitialized();
@@ -230,4 +265,4 @@ async function applyPasswordReset(tokenHash,passwordHash) {
 function getLocalSnapshotForTests() { if (databaseUrl) throw new Error('Test snapshot só está disponível no armazenamento JSON local.'); return readLocal(); }
 function restoreLocalSnapshotForTests(store) { if (databaseUrl) throw new Error('Test snapshot só está disponível no armazenamento JSON local.'); writeLocal(store); }
 
-module.exports = { StoreError, initialize, health, createUser, findUserByEmail, createSession, findUserBySession, deleteSession, createProject, listProjects, createEvaluation, updateEvaluation, listProfiles, createProfile, saveAnalysis, listAnalyses, createPasswordReset, applyPasswordReset, getLocalSnapshotForTests, restoreLocalSnapshotForTests };
+module.exports = { StoreError, initialize, health, createUser, findUserByEmail, createSession, findUserBySession, deleteSession, createProject, listProjects, createEvaluation, updateEvaluation, createProjectInvitation, listProjectInvitations, respondProjectInvitation, revokeProjectInvitation, listProfiles, createProfile, saveAnalysis, listAnalyses, createPasswordReset, applyPasswordReset, getLocalSnapshotForTests, restoreLocalSnapshotForTests };
