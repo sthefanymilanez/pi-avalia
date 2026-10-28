@@ -18,17 +18,20 @@ function readLocal() {
   fs.mkdirSync(dataDir, { recursive: true });
   if (!fs.existsSync(storePath)) fs.writeFileSync(storePath, JSON.stringify({ users: [], projects: [] }, null, 2));
   const raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-  return { users: raw.users || [], projects: raw.projects || [], profiles: raw.profiles || [], analyses: raw.analyses || [], passwordResets: raw.passwordResets || [], invitations: raw.invitations || [] };
+  return { users: raw.users || [], projects: raw.projects || [], profiles: raw.profiles || [], analyses: raw.analyses || [], passwordResets: raw.passwordResets || [], invitations: raw.invitations || [], presentationEvaluations: raw.presentationEvaluations || [] };
 }
 function writeLocal(store) {
   fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(storePath, JSON.stringify({ users: store.users || [], projects: store.projects || [], profiles: store.profiles || [], analyses: store.analyses || [], passwordResets: store.passwordResets || [], invitations: store.invitations || [] }, null, 2));
+  fs.writeFileSync(storePath, JSON.stringify({ users: store.users || [], projects: store.projects || [], profiles: store.profiles || [], analyses: store.analyses || [], passwordResets: store.passwordResets || [], invitations: store.invitations || [], presentationEvaluations: store.presentationEvaluations || [] }, null, 2));
 }
 function mapEvaluation(row) {
   return { id: row.id, evaluator: row.evaluator_name, evaluatorId: row.evaluator_id, status: row.status, scores: row.scores, criterionNotes: row.criterion_notes, comments: row.comments, result: row.result, createdAt: row.created_at, updatedAt: row.updated_at };
 }
+function mapPresentationEvaluation(row) {
+  return { id: row.id, evaluator: row.evaluator_name || row.evaluator, evaluatorId: row.evaluator_id || row.evaluatorId, status: row.status, scores: row.scores, criterionNotes: row.criterion_notes || row.criterionNotes, comments: row.comments, result: row.result === null ? null : Number(row.result), createdAt: row.created_at || row.createdAt, updatedAt: row.updated_at || row.updatedAt };
+}
 function mapProject(row) {
-  return { id: row.id, ownerId: row.owner_id, ownerName: row.owner_name || '', isOwner: Boolean(row.is_owner), title: row.title, course: row.course, className: row.class_name, team: row.team, scale: row.scale, sheetVersion: row.sheet_version, createdAt: row.created_at, evaluations: (row.evaluations || []).map(mapEvaluation) };
+  return { id: row.id, ownerId: row.owner_id, ownerName: row.owner_name || '', isOwner: Boolean(row.is_owner), title: row.title, course: row.course, className: row.class_name, team: row.team, scale: row.scale, sheetVersion: row.sheet_version, createdAt: row.created_at, evaluations: (row.evaluations || []).map(mapEvaluation), presentationEvaluations: (row.presentation_evaluations || row.presentationEvaluations || []).map(mapPresentationEvaluation) };
 }
 
 async function initialize() {
@@ -121,14 +124,37 @@ async function listProjects(userId) {
       'id', e.id, 'evaluator_name', evaluator.full_name, 'evaluator_id', e.evaluator_id,
       'status', e.status, 'scores', e.scores, 'criterion_notes', e.criterion_notes,
       'comments', e.comments, 'result', e.result, 'created_at', e.created_at, 'updated_at', e.updated_at
-    )) FILTER (WHERE e.id IS NOT NULL AND (e.status='enviada' OR e.evaluator_id=$1)), '[]'::jsonb) AS evaluations
+    )) FILTER (WHERE e.id IS NOT NULL AND (e.status='enviada' OR e.evaluator_id=$1)), '[]'::jsonb) AS evaluations,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('id', pe.id, 'evaluator_name', pevaluator.full_name, 'evaluator_id', pe.evaluator_id, 'status', pe.status, 'scores', pe.scores, 'criterion_notes', pe.criterion_notes, 'comments', pe.comments, 'result', pe.result, 'created_at', pe.created_at, 'updated_at', pe.updated_at) ORDER BY pe.created_at)
+      FROM presentation_evaluations pe JOIN professors pevaluator ON pevaluator.id=pe.evaluator_id WHERE pe.project_id=p.id AND (pe.status='enviada' OR pe.evaluator_id=$1)), '[]'::jsonb) AS presentation_evaluations
     FROM projects p JOIN professors owner ON owner.id=p.owner_id LEFT JOIN evaluations e ON e.project_id=p.id
     LEFT JOIN professors evaluator ON evaluator.id=e.evaluator_id
     WHERE p.owner_id=$1 OR EXISTS (SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$1 AND i.status='accepted') GROUP BY p.id, owner.full_name ORDER BY p.created_at DESC`, [userId]);
     return result.rows.map(mapProject);
   }
   const store=readLocal();const accepted=new Set(store.invitations.filter(i=>i.inviteeId===userId&&i.status==='accepted').map(i=>i.projectId));
-  return store.projects.filter(project=>project.ownerId===userId||accepted.has(project.id)).map(project=>({...project,isOwner:project.ownerId===userId,ownerName:store.users.find(u=>u.id===project.ownerId)?.name||''})).map(project=>({...project,evaluations:project.evaluations.filter(e=>e.status==='enviada'||e.evaluatorId===userId)}));
+  return store.projects.filter(project=>project.ownerId===userId||accepted.has(project.id)).map(project=>({...project,isOwner:project.ownerId===userId,ownerName:store.users.find(u=>u.id===project.ownerId)?.name||''})).map(project=>({...project,evaluations:project.evaluations.filter(e=>e.status==='enviada'||e.evaluatorId===userId),presentationEvaluations:store.presentationEvaluations.filter(e=>e.projectId===project.id&&(e.status==='enviada'||e.evaluatorId===userId)).map(e=>({...mapPresentationEvaluation(e),evaluator:e.evaluator||store.users.find(u=>u.id===e.evaluatorId)?.name||''}))}));
+}
+async function createPresentationEvaluation(projectId, userId, input, id, now) {
+  requireInitialized();
+  if (pool) {
+    const allowed = await pool.query("SELECT 1 FROM projects p WHERE p.id=$1 AND (p.owner_id=$2 OR EXISTS (SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$2 AND i.status='accepted'))", [projectId,userId]);
+    if (!allowed.rowCount) throw new StoreError(404,'Projeto não encontrado ou você não participa desta banca.');
+    const result=await pool.query(`INSERT INTO presentation_evaluations(id,project_id,evaluator_id,status,scores,criterion_notes,comments,result,created_at,updated_at) VALUES($1,$2,$3,'rascunho',$4,$5,'',NULL,$6,$6) ON CONFLICT(project_id,evaluator_id) DO UPDATE SET updated_at=presentation_evaluations.updated_at WHERE presentation_evaluations.status='rascunho' RETURNING *`,[id,projectId,userId,JSON.stringify(input.scores),JSON.stringify(Array(3).fill('')),now]);
+    if(!result.rowCount)throw new StoreError(409,'Você já enviou sua avaliação da apresentação para este projeto.');
+    return mapPresentationEvaluation(result.rows[0]);
+  }
+  const store=readLocal();const accepted=store.invitations.some(i=>i.projectId===projectId&&i.inviteeId===userId&&i.status==='accepted');const project=store.projects.find(p=>p.id===projectId&&(p.ownerId===userId||accepted));
+  if(!project)throw new StoreError(404,'Projeto não encontrado ou você não participa desta banca.');
+  const existing=store.presentationEvaluations.find(e=>e.projectId===projectId&&e.evaluatorId===userId);
+  if(existing?.status==='enviada')throw new StoreError(409,'Você já enviou sua avaliação da apresentação para este projeto.');
+  if(existing)return mapPresentationEvaluation(existing);
+  const evaluation={id,projectId,evaluatorId:userId,evaluator:store.users.find(u=>u.id===userId)?.name||'',status:'rascunho',scores:input.scores,criterionNotes:Array(3).fill(''),comments:'',result:null,createdAt:now,updatedAt:now};store.presentationEvaluations.push(evaluation);writeLocal(store);return mapPresentationEvaluation(evaluation);
+}
+async function updatePresentationEvaluation(projectId,userId,evaluationId,updates) {
+  requireInitialized();
+  if(pool){const result=await pool.query(`UPDATE presentation_evaluations pe SET status=$1,scores=$2,criterion_notes=$3,comments=$4,result=$5,updated_at=$6 FROM projects p WHERE pe.project_id=p.id AND (p.owner_id=$7 OR EXISTS(SELECT 1 FROM project_invitations i WHERE i.project_id=p.id AND i.invitee_id=$7 AND i.status='accepted')) AND pe.project_id=$8 AND pe.id=$9 AND pe.evaluator_id=$7 AND pe.status='rascunho' RETURNING pe.id`,[updates.status,JSON.stringify(updates.scores),JSON.stringify(updates.criterionNotes),updates.comments,updates.result,updates.updatedAt,userId,projectId,evaluationId]);if(result.rowCount)return;const check=await pool.query('SELECT status FROM presentation_evaluations WHERE project_id=$1 AND id=$2 AND evaluator_id=$3',[projectId,evaluationId,userId]);if(!check.rowCount)throw new StoreError(404,'Rascunho da apresentação não encontrado.');throw new StoreError(409,'Esta avaliação da apresentação já foi enviada e não pode ser alterada.');}
+  const store=readLocal();const accepted=store.invitations.some(i=>i.projectId===projectId&&i.inviteeId===userId&&i.status==='accepted');const project=store.projects.find(p=>p.id===projectId&&(p.ownerId===userId||accepted));const evaluation=store.presentationEvaluations.find(e=>e.projectId===projectId&&e.id===evaluationId&&e.evaluatorId===userId);if(!project)throw new StoreError(404,'Projeto não encontrado ou você não participa desta banca.');if(!evaluation)throw new StoreError(404,'Rascunho da apresentação não encontrado.');if(evaluation.status==='enviada')throw new StoreError(409,'Esta avaliação da apresentação já foi enviada e não pode ser alterada.');Object.assign(evaluation,updates);writeLocal(store);
 }
 async function createEvaluation(projectId, ownerId, evaluator, input, evaluationId, now) {
   requireInitialized();
@@ -265,4 +291,4 @@ async function applyPasswordReset(tokenHash,passwordHash) {
 function getLocalSnapshotForTests() { if (databaseUrl) throw new Error('Test snapshot só está disponível no armazenamento JSON local.'); return readLocal(); }
 function restoreLocalSnapshotForTests(store) { if (databaseUrl) throw new Error('Test snapshot só está disponível no armazenamento JSON local.'); writeLocal(store); }
 
-module.exports = { StoreError, initialize, health, createUser, findUserByEmail, createSession, findUserBySession, deleteSession, createProject, listProjects, createEvaluation, updateEvaluation, createProjectInvitation, listProjectInvitations, respondProjectInvitation, revokeProjectInvitation, listProfiles, createProfile, saveAnalysis, listAnalyses, createPasswordReset, applyPasswordReset, getLocalSnapshotForTests, restoreLocalSnapshotForTests };
+module.exports = { StoreError, initialize, health, createUser, findUserByEmail, createSession, findUserBySession, deleteSession, createProject, listProjects, createEvaluation, updateEvaluation, createPresentationEvaluation, updatePresentationEvaluation, createProjectInvitation, listProjectInvitations, respondProjectInvitation, revokeProjectInvitation, listProfiles, createProfile, saveAnalysis, listAnalyses, createPasswordReset, applyPasswordReset, getLocalSnapshotForTests, restoreLocalSnapshotForTests };

@@ -1,9 +1,11 @@
 const $ = (selector) => document.querySelector(selector);
 const projectDialog = $('#project-dialog');
 const evaluationDialog = $('#evaluation-dialog');
+const presentationDialog = $('#presentation-dialog');
 let criteria = [];
 let activeProject = null;
 let activeEvaluation = null;
+let activePresentationEvaluation = null;
 let currentCriterion = 0;
 let scores = [];
 let notes = [];
@@ -41,6 +43,13 @@ function invitationCard(invitation, received) {
   const actions=invitation.status==='pending'?(received?`<button type="button" class="primary" data-invitation-action="accept" data-id="${invitation.id}">Aceitar</button><button type="button" class="secondary" data-invitation-action="decline" data-id="${invitation.id}">Recusar</button>`:`<button type="button" class="secondary" data-invitation-action="revoke" data-id="${invitation.id}">Cancelar convite</button>`):(!received&&invitation.status==='accepted'?`<button type="button" class="secondary" data-invitation-action="revoke" data-id="${invitation.id}">Remover da banca</button>`:'');
   return `<article class="invitation-card"><div><strong>${escapeHtml(invitation.projectTitle)}</strong><small>${escapeHtml(counterpart)}</small></div><span class="pill">${status}</span><div class="invitation-actions">${actions}</div></article>`;
 }
+function presentationCard(project) {
+  const evaluations=project.presentationEvaluations||[];const mine=evaluations.find(item=>item.evaluatorId===signedInUser?.id);const sent=evaluations.filter(item=>item.status==='enviada');
+  const average=sent.length?(sent.reduce((sum,item)=>sum+Number(item.result||0),0)/sent.length).toFixed(2):null;
+  const button=mine?.status==='enviada'?'<button type="button" class="secondary" disabled>Avaliação enviada</button>':`<button type="button" class="primary" data-presentation-project="${project.id}" data-presentation-evaluation="${mine?.id||''}">${mine?'Continuar rascunho':'Avaliar apresentação'}</button>`;
+  const details=sent.length?`<details class="presentation-submissions"><summary>${sent.length} avaliação${sent.length===1?'':'ões'} enviada${sent.length===1?'':'s'} · média ${average}/30</summary>${sent.map(item=>`<p><strong>${escapeHtml(item.evaluator||'Professor')}</strong> · ${Number(item.result||0).toFixed(2)}/30</p>`).join('')}</details>`:'<small class="presentation-waiting">Nenhuma avaliação oral enviada ainda.</small>';
+  return `<article class="presentation-card"><div><p class="eyebrow">${escapeHtml([project.course,project.className].filter(Boolean).join(' · ')||'Projeto integrador')}</p><h2>${escapeHtml(project.title)}</h2>${!project.isOwner?`<small class="shared-owner">Banca organizada por ${escapeHtml(project.ownerName||'outro professor')}</small>`:''}<div class="presentation-summary"><span>${sent.length} de banca enviada${sent.length===1?'':'s'}</span>${average?`<strong>Média da apresentação: ${average}/30</strong>`:''}</div>${details}</div><div class="presentation-card-action">${button}</div></article>`;
+}
 async function refresh() {
   try {
     const [projects, criterionData, invitations] = await Promise.all([api('/api/projects'), api('/api/criteria'), api('/api/invitations')]); criteria = criterionData;
@@ -49,6 +58,7 @@ async function refresh() {
     $('#project-count').textContent = projects.length;
     $('#evaluation-count').textContent = projects.reduce((sum, item) => sum + (item.evaluations || []).filter((e) => e.status === 'enviada').length, 0);
     $('#project-list').innerHTML = filtered.length ? filtered.map(projectCard).join('') : `<div class="empty"><strong>${projects.length ? 'Nenhum projeto corresponde à busca' : 'Ainda não há projetos cadastrados'}</strong>${projects.length ? 'Tente outro título, curso ou turma.' : 'Cadastre um projeto para começar a organizar a avaliação.'}</div>`;
+    $('#presentation-list').innerHTML=projects.length?projects.map(presentationCard).join(''):'<div class="empty"><strong>Nenhum projeto disponível</strong>Cadastre um projeto ou aceite um convite para participar de uma banca.</div>';
     const evaluationRows=projects.flatMap(project=>(project.evaluations||[]).map(evaluation=>({project,evaluation})));
     $('#evaluation-list').innerHTML=evaluationRows.length?evaluationRows.map(({project,evaluation})=>{const sent=evaluation.status==='enviada';const status=sent?'Enviada':evaluation.status==='em_andamento'?'Em andamento':'Rascunho';const score=sent&&evaluation.result?` · Nota ${Number(evaluation.result.total).toFixed(2)}/100`:'';return `<article class="evaluation-row"><div><strong>${escapeHtml(project.title)}</strong><small>${escapeHtml(evaluation.evaluator||'Professor')} · ${escapeHtml([project.course,project.className].filter(Boolean).join(' · ')||'Curso e turma não informados')}</small></div><span class="pill">${status}</span><b>${score||'Aguardando conclusão'}</b></article>`;}).join(''):'<div class="empty"><strong>Nenhuma avaliação registrada</strong>Abra Projetos e selecione “Nova avaliação” para iniciar uma ficha.</div>';
     const selected=$('#invite-project').value;const owned=projects.filter(project=>project.isOwner);$('#invite-project').innerHTML=owned.length?'<option value="">Selecione um projeto</option>'+owned.map(project=>`<option value="${project.id}">${escapeHtml(project.title)}</option>`).join(''):'<option value="">Cadastre um projeto primeiro</option>';if(owned.some(project=>project.id===selected))$('#invite-project').value=selected;
@@ -56,6 +66,21 @@ async function refresh() {
     $('#received-invitations').innerHTML=incoming.length?incoming.map(item=>invitationCard(item,true)).join(''):'<div class="empty"><strong>Nenhum convite recebido</strong>Quando outro professor convidar você, ele aparecerá aqui.</div>';
     $('#sent-invitations').innerHTML=outgoing.length?outgoing.map(item=>invitationCard(item,false)).join(''):'<div class="empty"><strong>Nenhum convite enviado</strong>Convide professores cadastrados para compor uma banca.</div>';
   } catch (error) { $('#project-list').innerHTML = `<div class="empty"><strong>Não foi possível carregar os projetos</strong>${escapeHtml(error.message)}</div>`; }
+}
+function openPresentationEvaluation(project,evaluation=null) {
+  activeProject=project;activePresentationEvaluation=evaluation;$('#presentation-title').textContent=project.title;$('#presentation-status').textContent=evaluation?'Rascunho carregado. Continue a avaliação.':'As notas enviadas ficarão visíveis aos professores desta banca.';
+  const oralCriteria=criteria.filter(item=>item.stage==='apresentacao');const scoreValues=evaluation?.scores||Array(3).fill(null);const noteValues=evaluation?.criterionNotes||Array(3).fill('');
+  $('#presentation-criteria').innerHTML=oralCriteria.map((item,index)=>`<article class="presentation-criterion"><p class="eyebrow">CRITÉRIO ${index+1} DE ${oralCriteria.length}</p><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.description)}</p><label>Nota · escala de 0 a ${project.scale}<input class="presentation-score" data-index="${index}" type="number" min="0" max="${project.scale}" step="0.1" inputmode="decimal" value="${scoreValues[index]??''}" placeholder="Ex.: ${project.scale===10?'8,5':'0,8'}"></label><label>Evidência observada<textarea class="presentation-note" data-index="${index}" rows="3" maxlength="2000" placeholder="Registre um exemplo observado durante a apresentação.">${escapeHtml(noteValues[index]||'')}</textarea></label></article>`).join('');
+  $('#presentation-form [name="comments"]').value=evaluation?.comments||'';presentationDialog.showModal();
+}
+function readPresentationForm() {
+  const oralCriteria=criteria.filter(item=>item.stage==='apresentacao');const scores=oralCriteria.map((_,index)=>{const value=$(`.presentation-score[data-index="${index}"]`).value.trim().replace(',','.');return value===''?null:Number(value);});const criterionNotes=oralCriteria.map((_,index)=>$(`.presentation-note[data-index="${index}"]`).value);return {scores,criterionNotes,comments:$('#presentation-form [name="comments"]').value,scale:activeProject.scale};
+}
+async function savePresentation(status) {
+  const payload=readPresentationForm();for(const [index,score] of payload.scores.entries())if(score!==null&&(!Number.isFinite(score)||score<0||score>payload.scale))throw new Error(`A nota do critério ${index+1} precisa ficar entre 0 e ${payload.scale}.`);
+  if(status==='enviada'&&payload.scores.some(score=>score===null))throw new Error('Preencha as três notas antes de enviar a avaliação.');
+  if(!activePresentationEvaluation)activePresentationEvaluation=await api(`/api/projects/${activeProject.id}/presentation-evaluations`,{method:'POST',body:JSON.stringify({scores:Array(3).fill(null)})});
+  const result=await api(`/api/projects/${activeProject.id}/presentation-evaluations/${activePresentationEvaluation.id}`,{method:'PATCH',body:JSON.stringify({...payload,status})});activePresentationEvaluation=result;return result;
 }
 function parseLocalDraft(evaluator) {
   try { return JSON.parse(localStorage.getItem(storageKey()) || 'null'); } catch { return null; }
@@ -178,6 +203,9 @@ $('#evaluation-form').addEventListener('submit', async (event) => {
 $('#search').addEventListener('input', refresh);
 $('#invite-form').addEventListener('submit',async(event)=>{event.preventDefault();const form=event.currentTarget;const values=Object.fromEntries(new FormData(form));const button=form.querySelector('button[type="submit"]');button.disabled=true;$('#invite-status').textContent='Registrando convite…';try{const result=await api('/api/invitations',{method:'POST',body:JSON.stringify(values)});$('#invite-status').textContent=result.emailSent?'Convite enviado e notificado por e-mail.':'Convite registrado. O professor encontrará o pedido ao entrar na própria conta.';form.elements.email.value='';await refresh();}catch(error){$('#invite-status').textContent=error.message;}finally{button.disabled=false;}});
 $('#bancas').addEventListener('click',async(event)=>{const button=event.target.closest('[data-invitation-action]');if(!button)return;button.disabled=true;try{const action=button.dataset.invitationAction;const response=action==='revoke'?await api(`/api/invitations/${button.dataset.id}`,{method:'DELETE'}):await api(`/api/invitations/${button.dataset.id}/respond`,{method:'POST',body:JSON.stringify({decision:action==='accept'?'accepted':'declined'})});await refresh();notify(action==='accept'?'Convite aceito. O projeto agora aparece em Projetos.':action==='decline'?'Convite recusado.':'Convite cancelado ou participação removida.');}catch(error){notify(error.message);button.disabled=false;}});
+$('#presentation-list').addEventListener('click',async(event)=>{const button=event.target.closest('[data-presentation-project]');if(!button)return;try{const projects=await api('/api/projects');const project=projects.find(item=>item.id===button.dataset.presentationProject);if(!project)return;const evaluation=(project.presentationEvaluations||[]).find(item=>item.id===button.dataset.presentationEvaluation&&item.evaluatorId===signedInUser?.id);openPresentationEvaluation(project,evaluation||null);}catch(error){notify(error.message);}});
+$('#save-presentation-draft').addEventListener('click',async()=>{const button=$('#save-presentation-draft');button.disabled=true;$('#presentation-status').textContent='Salvando rascunho…';try{await savePresentation('rascunho');$('#presentation-status').textContent='Rascunho salvo. Só você pode vê-lo até enviar.';await refresh();}catch(error){$('#presentation-status').textContent=error.message;}finally{button.disabled=false;}});
+$('#submit-presentation').addEventListener('click',async()=>{const button=$('#submit-presentation');button.disabled=true;$('#presentation-status').textContent='Enviando avaliação…';try{await savePresentation('enviada');presentationDialog.close();await refresh();notify('Avaliação da apresentação enviada para a banca.');}catch(error){$('#presentation-status').textContent=error.message;button.disabled=false;}});
 
 function showAuth() { signedInUser = null; $('#auth-screen').hidden = false; $('#app-shell').hidden = true; }
 let analysisProjectId = null;

@@ -59,6 +59,12 @@ function validateDraft(input, scale) {
   if (input.status === 'enviada' && scores.some((score) => score === null)) throw Object.assign(new Error('Preencha os dez critérios antes de enviar a avaliação.'), { status: 400 });
   return scores;
 }
+function validatePresentationDraft(input, scale) {
+  if (!Array.isArray(input.scores) || input.scores.length !== 3) throw Object.assign(new Error('A avaliação da apresentação precisa conter os três critérios.'), { status: 400 });
+  const scores=input.scores.map((score,index)=>{if(score===null||score==='')return null;if(typeof score!=='number'||!Number.isFinite(score)||score<0||score>scale)throw Object.assign(new Error(`A nota do critério ${index+1} deve estar entre 0 e ${scale}.`),{status:400});return score;});
+  if(input.status==='enviada'&&scores.some(score=>score===null))throw Object.assign(new Error('Preencha os três critérios antes de enviar a avaliação da apresentação.'),{status:400});
+  return scores;
+}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
@@ -168,6 +174,17 @@ const server = http.createServer(async (req, res) => {
       const scale = input.scale === 1 ? 1 : 10;
       const project = await storage.createProject(user.id, { title, course: String(input.course || '').trim(), className: String(input.className || '').trim(), team: String(input.team || '').trim(), scale }, randomUUID(), new Date().toISOString());
       return send(res, 201, project);
+    }
+    const presentationMatch=url.pathname.match(/^\/api\/projects\/([^/]+)\/presentation-evaluations$/);
+    if(presentationMatch&&req.method==='POST'){
+      const input=await body(req);const project=(await storage.listProjects(user.id)).find(item=>item.id===presentationMatch[1]);if(!project)return send(res,404,{error:'Projeto não encontrado ou você não participa desta banca.'});
+      const scores=validatePresentationDraft({...input,status:'rascunho'},project.scale);const evaluation=await storage.createPresentationEvaluation(project.id,user.id,{scores},randomUUID(),new Date().toISOString());return send(res,201,evaluation);
+    }
+    const presentationUpdateMatch=url.pathname.match(/^\/api\/projects\/([^/]+)\/presentation-evaluations\/([^/]+)$/);
+    if(presentationUpdateMatch&&req.method==='PATCH'){
+      const input=await body(req);const project=(await storage.listProjects(user.id)).find(item=>item.id===presentationUpdateMatch[1]);if(!project)return send(res,404,{error:'Projeto não encontrado ou você não participa desta banca.'});
+      const current=project.presentationEvaluations.find(item=>item.id===presentationUpdateMatch[2]&&item.evaluatorId===user.id);if(!current)return send(res,404,{error:'Rascunho da apresentação não encontrado.'});if(current.status==='enviada')return send(res,409,{error:'Esta avaliação da apresentação já foi enviada e não pode ser alterada.'});
+      const status=['rascunho','enviada'].includes(input.status)?input.status:'rascunho';const scores=validatePresentationDraft({...input,status},project.scale);const notes=Array.isArray(input.criterionNotes)&&input.criterionNotes.length===3?input.criterionNotes.map(note=>String(note||'').slice(0,2000)):current.criterionNotes;const result=scores.every(score=>score!==null)?Math.round((scores.reduce((sum,score)=>sum+score/project.scale,0)*10+Number.EPSILON)*100)/100:null;const updates={status,scores,criterionNotes:notes,comments:String(input.comments||'').slice(0,10000),result,updatedAt:new Date().toISOString()};await storage.updatePresentationEvaluation(project.id,user.id,current.id,updates);return send(res,200,{...current,...updates});
     }
     if(url.pathname==='/api/invitations'&&req.method==='GET')return send(res,200,await storage.listProjectInvitations(user.id));
     if(url.pathname==='/api/invitations'&&req.method==='POST'){
